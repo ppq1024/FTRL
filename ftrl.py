@@ -233,6 +233,6 @@ def ftrl_adam(
         n.add_(v_hat)
         eta_new = (torch.sqrt(n) * alpha + 1) / lr
         sigma = eta_new - eta_old
-        z.add_(m_hat / torch.sqrt(v_hat + 1.0e-8), alpha=1 / (1 - betas[0] ** step_t)).addcmul_(sigma, param, value=-1)
+        z.add_(m_hat / (torch.sqrt(v_hat) + 1.0e-8), alpha=1 / (1 - betas[0] ** step_t)).addcmul_(sigma, param, value=-1)
         param.set_(-torch.nn.functional.softshrink(z, sparse) / (eta_new + weight_decay))
 
