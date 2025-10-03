@@ -13,7 +13,7 @@ class FTRL(Optimizer):
         params: ParamsT,
         lr: Union[float, Tensor] = 1e-3,
         alpha: float = 1.0,
-        sparse: float = 0, # L1 param
+        weight_shrink: float = 0, # L1 param
         weight_decay: float = 0, # L2 param
         *,
         maximize: bool = False,
@@ -23,7 +23,7 @@ class FTRL(Optimizer):
         defaults = dict(
             lr=lr,
             alpha=alpha,
-            sparse=sparse,
+            weight_shrink=weight_shrink,
             weight_decay=weight_decay,
             maximize=maximize,
         )
@@ -75,7 +75,7 @@ class FTRL(Optimizer):
                 *buffers,
                 lr=group["lr"],
                 alpha=group["alpha"],
-                sparse=group["sparse"],
+                weight_shrink=group["weight_shrink"],
                 weight_decay=group["weight_decay"],
                 maximize=group["maximize"]
             )
@@ -88,9 +88,8 @@ class FTRLAdam(Optimizer):
         self,
         params: ParamsT,
         lr: Union[float, Tensor] = 1e-3,
-        alpha: float = 1.0,
         betas: tuple[float, float] = (0.9, 0.999),
-        sparse: float = 0, # L1 param
+        weight_shrink: float = 0, # L1 param
         weight_decay: float = 0, # L2 param
         *,
         maximize: bool = False,
@@ -99,9 +98,8 @@ class FTRLAdam(Optimizer):
 
         defaults = dict(
             lr=lr,
-            alpha=alpha,
             betas=betas,
-            sparse=sparse,
+            weight_shrink=weight_shrink,
             weight_decay=weight_decay,
             maximize=maximize,
         )
@@ -121,7 +119,6 @@ class FTRLAdam(Optimizer):
         grads,
         m_buffer,
         v_buffer,
-        n_buffer,
         z_buffer,
         steps
     ):
@@ -139,9 +136,6 @@ class FTRLAdam(Optimizer):
                 state["v"] = torch.zeros_like(
                     p, memory_format=torch.preserve_format
                 )
-                state["n"] = torch.zeros_like(
-                    p, memory_format=torch.preserve_format
-                )
                 state["z"] = torch.zeros_like(
                     p, memory_format=torch.preserve_format
                 )
@@ -150,7 +144,6 @@ class FTRLAdam(Optimizer):
                 )
             m_buffer.append(state["m"])
             v_buffer.append(state["v"])
-            n_buffer.append(state["n"])
             z_buffer.append(state["z"])
             steps.append(state["step"])
 
@@ -162,14 +155,13 @@ class FTRLAdam(Optimizer):
             loss = closure()
 
         for group in self.param_groups:
-            buffers = [[] for _ in range(7)]
+            buffers = [[] for _ in range(6)]
             self._init_group(group, *buffers)
             ftrl_adam(
                 *buffers,
                 lr=group["lr"],
-                alpha=group["alpha"],
                 betas=group["betas"],
-                sparse=group["sparse"],
+                weight_shrink=group["weight_shrink"],
                 weight_decay=group["weight_decay"],
                 maximize=group["maximize"]
             )
@@ -185,7 +177,7 @@ def ftrl(
     *,
     lr: float,
     alpha: float,
-    sparse: float,
+    weight_shrink: float,
     weight_decay: float,
     maximize: bool,
 ):
@@ -198,7 +190,7 @@ def ftrl(
         eta_new = (torch.sqrt(n) * alpha + 1) / lr
         sigma = eta_new - eta_old
         z.add_(grad).addcmul_(sigma, param, value=-1)
-        param.set_(-torch.nn.functional.softshrink(z, sparse) / (eta_new + weight_decay))
+        param.set_(-torch.nn.functional.softshrink(z, weight_shrink) / (eta_new + weight_decay))
 
 
 def ftrl_adam(
@@ -206,33 +198,38 @@ def ftrl_adam(
     grads: list[Tensor],
     m_buffer: list[Tensor],
     v_buffer: list[Tensor],
-    n_buffer: list[Tensor],
     z_buffer: list[Tensor],
     steps: list[Tensor],
     *,
     lr: float,
-    alpha: float,
     betas: tuple[float, float],
-    sparse: float,
+    weight_shrink: float,
     weight_decay: float,
     maximize: bool,
 ):
+    beta1, beta2 = betas
+    one_minus_beta1 = 1.0 - beta1
+    one_minus_beta2 = 1.0 - beta2
+    eps = 1.0e-8
+
     for i, param in enumerate(params):
         grad = grads[i] if not maximize else -grads[i]
         m = m_buffer[i]
         v = v_buffer[i]
-        n = n_buffer[i]
         z = z_buffer[i]
         step_t = steps[i]
+
+        current_step = step_t.item()
         step_t.add_(1)
-        m.mul_(betas[0]).add_(grad, alpha=(1 - betas[0]))
-        v.mul_(betas[1]).addcmul_(grad, grad, value=(1 - betas[1]))
-        m_hat = m / (1 - betas[0] ** step_t)
-        v_hat = v / (1 - betas[1] ** step_t)
-        eta_old = (torch.sqrt(n) * alpha + 1) / lr if step_t > 0 else 0
-        n.add_(v_hat)
-        eta_new = (torch.sqrt(n) * alpha + 1) / lr
-        sigma = eta_new - eta_old
-        z.add_(m_hat / (torch.sqrt(v_hat) + 1.0e-8), alpha=1 / (1 - betas[0] ** step_t)).addcmul_(sigma, param, value=-1)
-        param.set_(-torch.nn.functional.softshrink(z, sparse) / (eta_new + weight_decay))
+        beta1_pow_current = beta1 ** current_step
+        beta2_pow_current = beta2 ** current_step
+        beta1_pow_next = beta1_pow_current * beta1
+        beta2_pow_next = beta2_pow_current * beta2
+
+        eta_old = torch.sqrt_(v / ((1 - beta2_pow_current) if current_step > 0 else 1))
+        m.mul_(beta1).add_(grad, alpha=(one_minus_beta1))
+        v.mul_(beta2).addcmul_(grad, grad, value=one_minus_beta2)
+        eta_new = torch.sqrt_(v / (1 - beta2_pow_next))
+        z.add_(m, alpha=-(lr / (1 - beta1_pow_next))).addcmul_((eta_new - eta_old), param)
+        torch.div(torch.nn.functional.softshrink(z, weight_shrink), eta_new.add_(weight_decay * lr + eps), out=param)
 
